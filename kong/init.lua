@@ -27,12 +27,11 @@
 require "luarocks.loader"
 require "resty.core"
 
+local constants = require "kong.constants"
+
 do
   -- let's ensure the required shared dictionaries are
   -- declared via lua_shared_dict in the Nginx conf
-
-  local constants = require "kong.constants"
-
   for _, dict in ipairs(constants.DICTS) do
     if not ngx.shared[dict] then
       return error("missing shared dict '" .. dict .. "' in Nginx "          ..
@@ -51,6 +50,7 @@ local dns = require "kong.tools.dns"
 local core = require "kong.core.handler"
 local utils = require "kong.tools.utils"
 local lapis = require "lapis"
+local arguments = require "kong.api.arguments"
 local responses = require "kong.tools.responses"
 local singletons = require "kong.singletons"
 local DAOFactory = require "kong.dao.factory"
@@ -67,6 +67,10 @@ local ngx_log          = ngx.log
 local ngx_ERR          = ngx.ERR
 local ngx_CRIT         = ngx.CRIT
 local ngx_DEBUG        = ngx.DEBUG
+local null             = ngx.null
+local type             = type
+local next             = next
+local pairs            = pairs
 local ipairs           = ipairs
 local assert           = assert
 local tostring         = tostring
@@ -146,6 +150,172 @@ local function load_plugins(kong_conf, dao)
 
   return sorted_plugins
 end
+
+
+local function mock_plugins(ctx, phase)
+  local mock    = ctx.mock     or {}
+  local plugins = mock.plugins or {}
+  local phase   = phase        or ngx.get_phase()
+
+  local BasePlugin = require "kong.plugins.base_plugin"
+
+  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, phase == "rewrite" or phase == "access") do
+    if plugin.handler[phase] ~= BasePlugin[phase] then
+      table.insert(plugins, {
+        name        = plugin.handler._name,
+        version     = plugin.handler.VERSION,
+        priority    = plugin.handler.PRIORITY,
+        no_consumer = plugin.schema.no_consumer,
+        phase       = phase,
+        config      = plugin_conf,
+      })
+    end
+  end
+
+  mock.plugins = plugins
+  ctx.mock     = mock
+end
+
+
+local function mock_consumer(ctx)
+  local consumer_id
+
+  local args = arguments.load({ multipart = false })
+  if args then
+    consumer_id = args.consumer
+    if type(consumer_id) == "table" then
+      consumer_id = consumer_id[1]
+    end
+  end
+
+  if consumer_id then
+    local consumer
+    local consumer_cache_key = singletons.dao.consumers:cache_key(consumer_id)
+
+    if type(consumer_id) == "string" or type(consumer_id) == "number" then
+      consumer_id = tostring(consumer_id)
+
+      if utils.is_valid_uuid(consumer_id) then
+        consumer = singletons.cache:get(
+          consumer_cache_key,
+          nil,
+          function(consumer_id)
+            return singletons.dao.consumers:find { id = consumer_id }
+          end,
+          consumer_id)
+
+      else
+        local result = singletons.dao.consumers:find_all { username = consumer_id }
+        if type(result) == "table" and type(result[1]) == "table" then
+          consumer =  result[1]
+        end
+
+        if not consumer then
+          result = singletons.dao.consumers:find_all { custom_id = consumer_id }
+          if type(result) == "table" and type(result[1]) == "table" then
+            consumer = result[1]
+          end
+        end
+      end
+    end
+
+    if consumer then
+      ctx.authenticated_consumer   = consumer
+      ctx.authenticated_credential = {
+        consumer_id = consumer.id
+      }
+
+      ngx.req.set_header(constants.HEADERS.CONSUMER_ID,        consumer.id)
+      ngx.req.set_header(constants.HEADERS.CONSUMER_CUSTOM_ID, consumer.custom_id)
+      ngx.req.set_header(constants.HEADERS.CONSUMER_USERNAME,  consumer.username)
+
+    else
+      return responses.send_HTTP_BAD_REQUEST("consumer not found")
+    end
+  end
+end
+
+
+local function mock_addr(any)
+  local configuration = singletons.configuration
+
+  if any or ngx.var.upstream_scheme == "https" then
+    for _, proxy_server in ipairs(configuration.proxy_servers) do
+      if proxy_server.mock then
+        for _, listener in ipairs(proxy_server.listeners) do
+          if any or listener.ssl then
+            return listener.ip, listener.port
+          end
+        end
+      end
+    end
+  end
+
+  if not any then
+    return mock_addr(true)
+  end
+end
+
+local function mock_data(ctx)
+  local mock = ctx.mock
+
+  local api = ctx.api
+  if api and next(api) then
+    mock.api = api
+
+  else
+    mock.api = null
+  end
+
+  local service = ctx.service
+  if service and next(service) then
+    mock.service = service
+
+  else
+    mock.service = null
+  end
+
+  local route = ctx.route
+  if route and next(route) then
+    mock.route = route
+
+  else
+    mock.route = null
+  end
+
+  local router_matches = ctx.router_matches
+  if router_matches and next(router_matches) then
+    mock.router_matches = router_matches
+
+  else
+    mock.router_matches = null
+  end
+
+  local balancer_address = ctx.balancer_address
+  if balancer_address and next(balancer_address) then
+    mock.balancer_address = balancer_address
+
+  else
+    mock.balancer_address = null
+  end
+
+  local authenticated_consumer = ctx.authenticated_consumer
+  if authenticated_consumer and next(authenticated_consumer) then
+    mock.authenticated_consumer = authenticated_consumer
+
+  else
+    mock.authenticated_consumer = null
+  end
+
+  local authenticated_credential = ctx.authenticated_credential
+  if authenticated_credential and next(authenticated_credential) then
+    mock.authenticated_credential = authenticated_credential
+
+  else
+    mock.authenticated_credential = null
+  end
+end
+
 
 -- Kong public context handlers.
 -- @section kong_handlers
@@ -295,16 +465,21 @@ function Kong.init_worker()
   end
 end
 
-function Kong.ssl_certificate()
+function Kong.ssl_certificate(mock)
   local ctx = ngx.ctx
-  core.certificate.before(ctx)
+  core.certificate.before(ctx, mock)
 
-  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
-    plugin.handler:certificate(plugin_conf)
+  if mock then
+    mock_plugins(ctx)
+
+  else
+    for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
+      plugin.handler:certificate(plugin_conf)
+    end
   end
 end
 
-function Kong.balancer()
+function Kong.balancer(mock)
   local ctx = ngx.ctx
   local addr = ctx.balancer_address
   local tries = addr.tries
@@ -312,7 +487,7 @@ function Kong.balancer()
   addr.try_count = addr.try_count + 1
   tries[addr.try_count] = current_try
 
-  core.balancer.before()
+  core.balancer.before(ctx, mock)
 
   if addr.try_count > 1 then
     -- only call balancer on retry, first one is done in `core.access.after` which runs
@@ -323,8 +498,8 @@ function Kong.balancer()
     local previous_try = tries[addr.try_count - 1]
     previous_try.state, previous_try.code = get_last_failure()
 
-    -- Report HTTP status for health checks
-    if addr.balancer then
+    if not mock and addr.balancer then
+      -- Report HTTP status for health checks
       if previous_try.state == "failed" then
         addr.balancer.report_tcp_failure(addr.ip, addr.port)
       else
@@ -335,7 +510,7 @@ function Kong.balancer()
     local ok, err, errcode = balancer_execute(addr)
     if not ok then
       ngx_log(ngx_ERR, "failed to retry the dns/balancer resolver for ",
-              tostring(addr.host), "' with: ", tostring(err))
+        tostring(addr.host), "' with: ", tostring(err))
       return ngx.exit(errcode)
     end
 
@@ -347,57 +522,80 @@ function Kong.balancer()
     end
   end
 
-  current_try.ip   = addr.ip
-  current_try.port = addr.port
+  local ip, port = addr.ip, addr.port
+
+  current_try.ip   = ip
+  current_try.port = port
+
+  if mock then
+    ip, port = mock_addr()
+  end
 
   -- set the targets as resolved
   ngx_log(ngx_DEBUG, "setting address (try ", addr.try_count, "): ",
-                     addr.ip, ":", addr.port)
-  local ok, err = set_current_peer(addr.ip, addr.port)
+    ip, ":", port)
+
+  local ok, err = set_current_peer(ip, port)
   if not ok then
     ngx_log(ngx_ERR, "failed to set the current peer (address: ",
-            tostring(addr.ip), " port: ", tostring(addr.port),"): ",
-            tostring(err))
+      tostring(ip), " port: ", tostring(port),"): ",
+      tostring(err))
     return ngx.exit(500)
   end
 
   ok, err = set_timeouts(addr.connect_timeout / 1000,
-                         addr.send_timeout / 1000,
-                         addr.read_timeout / 1000)
+   addr.send_timeout / 1000,
+    addr.read_timeout / 1000)
   if not ok then
     ngx_log(ngx_ERR, "could not set upstream timeouts: ", err)
   end
 
-  core.balancer.after()
+  core.balancer.after(ctx, mock)
 end
 
-function Kong.rewrite()
+function Kong.rewrite(mock)
   local ctx = ngx.ctx
-  core.rewrite.before(ctx)
+  core.rewrite.before(ctx, mock)
 
-  -- we're just using the iterator, as in this rewrite phase no consumer nor
-  -- api will have been identified, hence we'll just be executing the global
-  -- plugins
-  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
-    plugin.handler:rewrite(plugin_conf)
+  if mock then
+    mock_plugins(ctx)
+  else
+    -- we're just using the iterator, as in this rewrite phase no consumer nor
+    -- api will have been identified, hence we'll just be executing the global
+    -- plugins
+    for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
+      plugin.handler:rewrite(plugin_conf)
+    end
   end
 
-  core.rewrite.after(ctx)
+  core.rewrite.after(ctx, mock)
 end
 
-function Kong.access()
+function Kong.access(mock)
   local ctx = ngx.ctx
 
-  core.access.before(ctx)
+  core.access.before(ctx, mock)
 
   ctx.delay_response = true
 
-  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
-    if not ctx.delayed_response then
-      local err = coroutine.wrap(plugin.handler.access)(plugin.handler, plugin_conf)
-      if err then
-        ctx.delay_response = false
-        return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+  if mock then
+    local var = ngx.var
+
+    var.upstream_scheme = var.scheme
+    var.upstream_uri    = "/kong_mock_service"
+
+    mock_consumer(ctx)
+    mock_plugins(ctx)
+    mock_data(ctx)
+
+  else
+    for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins, true) do
+      if not ctx.delayed_response then
+        local err = coroutine.wrap(plugin.handler.access)(plugin.handler, plugin_conf)
+        if err then
+          ctx.delay_response = false
+          return responses.send_HTTP_INTERNAL_SERVER_ERROR(err)
+        end
       end
     end
   end
@@ -408,40 +606,92 @@ function Kong.access()
 
   ctx.delay_response = false
 
-  core.access.after(ctx)
+  core.access.after(ctx, mock)
 end
 
-function Kong.header_filter()
+function Kong.header_filter(mock)
   local ctx = ngx.ctx
-  core.header_filter.before(ctx)
+  core.header_filter.before(ctx, mock)
 
-  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
-    plugin.handler:header_filter(plugin_conf)
+  if mock then
+    if ctx.KONG_PROXIED then
+      mock_plugins(ctx)
+
+      ngx.header.content_length = nil
+      ngx.header.content_type   = "application/json"
+    end
+
+  else
+    for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
+      plugin.handler:header_filter(plugin_conf)
+    end
   end
 
-  core.header_filter.after(ctx)
+  core.header_filter.after(ctx, mock)
 end
 
-function Kong.body_filter()
+function Kong.body_filter(mock)
   local ctx = ngx.ctx
-  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
-    plugin.handler:body_filter(plugin_conf)
+
+  if mock then
+    if ctx.KONG_PROXIED then
+      mock_plugins(ctx)
+
+      local ctx = ngx.ctx
+      local mock = ctx.mock
+
+      mock.request = (mock.request or "") .. ngx.arg[1]
+
+      if ngx.arg[2] then
+        mock_plugins(ctx, "log")
+
+        local cjson = require "cjson.safe"
+        mock.request = cjson.decode(mock.request)
+        ngx.arg[1] = cjson.encode(mock)
+
+      else
+        ngx.arg[1] = nil
+      end
+    end
+
+  else
+    for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
+      plugin.handler:body_filter(plugin_conf)
+    end
   end
 
-  core.body_filter.after(ctx)
+  core.body_filter.after(ctx, mock)
 end
 
-function Kong.log()
+function Kong.log(mock)
   local ctx = ngx.ctx
-  for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
-    plugin.handler:log(plugin_conf)
+
+  if not mock then
+    for plugin, plugin_conf in plugins_iterator(singletons.loaded_plugins) do
+      plugin.handler:log(plugin_conf)
+    end
   end
 
-  core.log.after(ctx)
+  core.log.after(ctx, mock)
 end
 
-function Kong.handle_error()
-  return kong_error_handlers(ngx)
+function Kong.mock_service()
+  local request = {
+    headers = ngx.req.get_headers(nil, true),
+  }
+
+  local args        = arguments.load({ decode = false })
+  request.method    = ngx.req.get_method()
+  request.uri_args  = args.uri
+  request.post_args = args.post
+  request.body_data = args.body
+
+  responses.send_HTTP_OK(request)
+end
+
+
+function Kong.handle_error(mock)
+  return kong_error_handlers(ngx, mock)
 end
 
 function Kong.serve_admin_api(options)

@@ -403,20 +403,20 @@ return {
     end
   },
   certificate = {
-    before = function(_)
+    before = function(ctx, mock)
       certificate.execute()
     end
   },
   rewrite = {
-    before = function(ctx)
+    before = function(ctx, mock)
       ctx.KONG_REWRITE_START = get_now()
     end,
-    after = function (ctx)
+    after = function (ctx, mock)
       ctx.KONG_REWRITE_TIME = get_now() - ctx.KONG_REWRITE_START -- time spent in Kong's rewrite_by_lua
     end
   },
   access = {
-    before = function(ctx)
+    before = function(ctx, mock)
       -- ensure routers are up-to-date
       local cache = singletons.cache
 
@@ -607,7 +607,7 @@ return {
       var.upstream_x_forwarded_port  = forwarded_port
     end,
     -- Only executed if the `router` module found a route and allows nginx to proxy it.
-    after = function(ctx)
+    after = function(ctx, mock)
       local var = ngx.var
 
       do
@@ -664,13 +664,12 @@ return {
     end
   },
   balancer = {
-    before = function()
-      local addr = ngx.ctx.balancer_address
+    before = function(ctx, mock)
+      local addr = ctx.balancer_address
       local current_try = addr.tries[addr.try_count]
       current_try.balancer_start = get_now()
     end,
-    after = function ()
-      local ctx = ngx.ctx
+    after = function (ctx, mock)
       local addr = ctx.balancer_address
       local current_try = addr.tries[addr.try_count]
 
@@ -684,7 +683,7 @@ return {
     end
   },
   header_filter = {
-    before = function(ctx)
+    before = function(ctx, mock)
       if ctx.KONG_PROXIED then
         local now = get_now()
         -- time spent waiting for a response from upstream
@@ -692,7 +691,7 @@ return {
         ctx.KONG_HEADER_FILTER_STARTED_AT = now
       end
     end,
-    after = function(ctx)
+    after = function(ctx, mock)
       local header = ngx.header
 
       if ctx.KONG_PROXIED then
@@ -716,7 +715,7 @@ return {
     end
   },
   body_filter = {
-    after = function(ctx)
+    after = function(ctx, mock)
       if ngx.arg[2] and ctx.KONG_PROXIED then
         -- time spent receiving the response (header_filter + body_filter)
         -- we could use $upstream_response_time but we need to distinguish the waiting time
@@ -726,8 +725,13 @@ return {
     end
   },
   log = {
-    after = function(ctx)
+    after = function(ctx, mock)
+      if not mock then
+        return
+      end
+
       reports.log()
+
       local addr = ctx.balancer_address
 
       -- If response was produced by an upstream (ie, not by a Kong plugin)
