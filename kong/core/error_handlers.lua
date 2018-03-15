@@ -1,7 +1,10 @@
 local singletons = require "kong.singletons"
+local bit           = require "bit"
+local constants   = require "kong.constants"
 
 local find = string.find
 local format = string.format
+local band           = bit.band
 
 local TYPE_PLAIN = "text/plain"
 local TYPE_JSON = "application/json"
@@ -56,7 +59,7 @@ return function(ngx)
   local status = ngx.status
   message = BODIES["s" .. status] and BODIES["s" .. status] or format(BODIES.default, status)
 
-  if singletons.configuration.server_tokens then
+  if band(constants.HEADER_MASKS[constants.HEADERS.SERVER], singletons.configuration.header_mask) then
     ngx.header["Server"] = SERVER_HEADER
   end
 

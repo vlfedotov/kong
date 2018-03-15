@@ -16,6 +16,7 @@ local constants   = require "kong.constants"
 local responses   = require "kong.tools.responses"
 local singletons  = require "kong.singletons"
 local certificate = require "kong.core.certificate"
+local bit           = require "bit"
 
 
 local tostring    = tostring
@@ -28,6 +29,7 @@ local log         = ngx.log
 local null        = ngx.null
 local ngx_now     = ngx.now
 local unpack      = unpack
+local band           = bit.band
 
 
 local ERR         = ngx.ERR
@@ -696,17 +698,20 @@ return {
       local header = ngx.header
 
       if ctx.KONG_PROXIED then
-        if singletons.configuration.latency_tokens then
+        if band(constants.HEADER_MASKS[constants.HEADERS.UPSTREAM_LATENCY], singletons.configuration.header_mask) then
           header[constants.HEADERS.UPSTREAM_LATENCY] = ctx.KONG_WAITING_TIME
+        end
+
+        if band(constants.HEADER_MASKS[constants.HEADERS.PROXY_LATENCY], singletons.configuration.header_mask) then
           header[constants.HEADERS.PROXY_LATENCY]    = ctx.KONG_PROXY_LATENCY
         end
 
-        if singletons.configuration.server_tokens then
+        if band(constants.HEADER_MASKS[constants.HEADERS.VIA], singletons.configuration.header_mask) then
           header["Via"] = server_header
         end
 
       else
-        if singletons.configuration.server_tokens then
+        if band(constants.HEADER_MASKS[constants.HEADERS.SERVER], singletons.configuration.header_mask) then
           header["Server"] = server_header
 
         else

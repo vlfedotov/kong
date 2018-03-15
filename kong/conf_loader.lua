@@ -11,7 +11,9 @@ local utils = require "kong.tools.utils"
 local log = require "kong.cmd.utils.log"
 local ip = require "kong.tools.ip"
 local ciphers = require "kong.tools.ciphers"
+local bit           = require "bit"
 
+local bor           = bit.bor
 local DEFAULT_PATHS = {
   "/etc/kong/kong.conf",
   "/etc/kong.conf"
@@ -61,8 +63,7 @@ local CONF_INFERENCES = {
   nginx_user = {typ = "string"},
   nginx_worker_processes = {typ = "string"},
   upstream_keepalive = {typ = "number"},
-  server_tokens = {typ = "boolean"},
-  latency_tokens = {typ = "boolean"},
+  tokens = {typ = "array"},
   trusted_ips = {typ = "array"},
   real_ip_header = {typ = "string"},
   real_ip_recursive = {typ = "ngx_boolean"},
@@ -293,6 +294,22 @@ local function check_and_infer(conf)
       errors[#errors+1] = "dns_hostsfile: file does not exist"
     end
   end
+
+  local mask = 0
+  if conf.tokens then
+    local allowed = constants.HEADER_MASKS
+    for _, token in ipairs(conf.tokens) do
+      if token == "off" then
+          mask = 0
+          break
+      elseif allowed[token] == nil then -- TODO what about case sensetive??
+        errors[#errors+1] = "tokens: invalid entry '" .. tostring(token) .. "'"
+      else
+        mask = bor(mask,allowed[token])
+      end
+    end
+  end
+  conf.header_mask = mask
 
   if conf.dns_order then
     local allowed = { LAST = true, A = true, CNAME = true, SRV = true }
