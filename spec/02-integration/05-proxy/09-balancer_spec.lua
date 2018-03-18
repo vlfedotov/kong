@@ -346,7 +346,7 @@ dao_helpers.for_each_dao(function(kong_config)
       end)
 
       -- Regression test for a missing invalidation in 0.12rc1
-      it("created via the API are functional", function()
+      it("#o created via the API are functional", function()
         assert.same(201, api_send("POST", "/upstreams", {
           name = "test_upstream", slots = 10,
         }))
